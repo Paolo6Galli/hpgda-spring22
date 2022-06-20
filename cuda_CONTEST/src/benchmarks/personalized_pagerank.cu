@@ -189,12 +189,6 @@ void PersonalizedPageRank::alloc() {
     // Allocate any GPU data here;
     // TODO!
     int size = sizeof(float) * E;
-    
-    float *val_float;
-    std::transform(val.begin(), val.end(), val_float, [](double d) -> float {return float(d);});
-
-    float *pr_float;
-    std::transform(pr.begin(), pr.end(), pr_float, [](double d) -> float {return float(d);});
 
     cudaMalloc(&x_gpu, size);
     cudaMalloc(&y_gpu, size);
@@ -202,16 +196,6 @@ void PersonalizedPageRank::alloc() {
     cudaMalloc(&dangling_gpu, sizeof(int)*dangling.size());
     cudaMalloc(&V_gpu, sizeof(int));
     cudaMalloc(&pr_gpu, sizeof(float) * V);
-
-    cudaMemcpy(x_gpu, x.data(), size, cudaMemcpyHostToDevice);
-    cudaMemcpy(y_gpu, y.data(), size, cudaMemcpyHostToDevice);
-    cudaMemcpy(val_gpu, val_float, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(dangling_gpu, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(V_gpu, &V, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(pr_gpu, pr_float, sizeof(float) * V, cudaMemcpyHostToDevice);
-
-    free(val_float);
-    free(pr_float);
 }
 
 // Initialize data;
@@ -236,11 +220,28 @@ void PersonalizedPageRank::reset() {
    personalization_vertex = rand() % V; 
    if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
 
+     int size = sizeof(float) * E;
+
+    float *val_float = (float *) malloc(sizeof(float)*E);
+    std::transform(val.begin(), val.end(), val_float, [](double d) -> float {return float(d);});
+
+    float *pr_float = (float *) malloc(sizeof(float)*V);
+    std::transform(pr.begin(), pr.end(), pr_float, [](double d) -> float {return float(d);});
+
    // Do any GPU reset here, and also transfer data to the GPU;
    // TODO!
+    cudaMemcpy(x_gpu, x.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(y_gpu, y.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(val_gpu, val_float, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(dangling_gpu, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(V_gpu, &V, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(pr_gpu, pr_float, sizeof(float) * V, cudaMemcpyHostToDevice);
+
+    if (debug) std::cout << "reset successful" << std::endl;
 }
 
 void PersonalizedPageRank::execute(int iter) {
+    if (debug) std::cout << "starting execution" << std::endl;
     // Do the GPU computation here, and also transfer results to the CPU;
     //TODO! (and save the GPU PPR values into the "pr" array)
     int block_size = 128;
@@ -253,6 +254,8 @@ void PersonalizedPageRank::execute(int iter) {
     bool converged = false;
     while (!converged && iter < max_iterations) {    
         memset(pr_tmp, 0, sizeof(float) * V);
+        if (debug) std::cout << "launching gpu kernel" << std::endl;
+        //TODO: allocate pr_tmp on GPU and retrieve with CudaMemCopy
         spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, E);
         float dangling_factor = dot_product_cpu_float(dangling_gpu, pr_gpu, V); 
         axpb_personalized_cpu_float(alpha_f, pr_tmp, alpha_f * dangling_factor / V, personalization_vertex, pr_tmp, V);
@@ -260,7 +263,7 @@ void PersonalizedPageRank::execute(int iter) {
         // Check convergence;
         float err = euclidean_distance_cpu_float(pr_gpu, pr_tmp, V);
         converged = err <= convergence_threshold;
-
+        if (debug) std::cout << "error = " << err << std::endl;
         // Update the PageRank vector;
         memcpy(pr_gpu, pr_tmp, sizeof(float) * V);
         iter++;
