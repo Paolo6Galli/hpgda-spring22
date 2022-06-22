@@ -29,6 +29,10 @@
 
 #include <sstream>
 #include "personalized_pagerank.cuh"
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
 
 namespace chrono = std::chrono;
 using clock_type = chrono::high_resolution_clock;
@@ -50,24 +54,23 @@ int *x_csr;
 int *y_ptr;
 float *val_csr;
 
-#define log_warp_size 5;
-#define warp_size 32;
+//#define log_warp_size 5;
+//#define warp_size 32;
 
 __global__ void spmv(
                     const int *x, 
                     const int *y, //y_ptr
                     const float *val, 
                     const float *vec, 
-                    float *result, 
-                    int E, 
+                    float *result,
                     int V,
                     float dang,
                     int pers) {
 	int id = threadIdx.x+blockIdx.x*blockDim.x;
 	int res = 0;
-    if (id < E - 1) {
+    if (id < V - 1) {
         int els = y[id] - (id == 0 ? 0 : y[id-1]);
-        if (els = 0) {
+        if (els == 0) {
             res = dang;
         }
         else {
@@ -80,39 +83,54 @@ __global__ void spmv(
         result[id] = res;
     }
 }
-/*
-__global__ void dangle_factor(const int *dangle, const int *pr, int V, float *buffer, float result) {
 
+__global__ void dangle_factor(
+                            const int *x,
+                            const int *y, //y_ptr
+                            const float *pr,
+                            int V,
+                            float result) {
+
+    extern __shared__ float buffer[];
 	//assert(sizeof(buffer) >= ((V >> log_warp_size) + 1));
-	int index = threadIdx.x+blockIdx.x*blockDim.x;
-	int warp_id = index >> log_warp_size;
-	int partial = dangle[index]*pr[index];
-	for (int offset = 16; offset > 0; offset /= 2) {
-		partial += __shfl_down_sync(0xffffffff, partial, offset);
-	}
-	if ((index % warp_size) == 0) {
-		buffer[warp_id] = partial;
-	}
+    int id = threadIdx.x+blockIdx.x*blockDim.x;
+    int partial = 0;
+    int warp_size = 32;
+    int log_warp_size = 5;
 
-	__syncthreads();
+    if (id < V - 1) {
+        int els = y[id] - (id == 0 ? 0 : y[id-1]);
+        if (els == 0) {
+            partial = pr[x[y[id]]];
+        }
+        for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        }
+        
+        if ((id % warp_size) == 0) {
+            buffer[(id >> log_warp_size)] = partial;
+        }
 
-	int n_sums = (V << log_warp_size) + (V % warp_size);
-		while (n_sums > 1) {
-			if (index < n_sums){
-				partial = buffer[index];
-				for (int offset = 16; offset > 0; offset /= 2) {
-					partial += __shfl_down_sync(0xffffffff, partial, offset);
-				}
-				__syncthreads();
-				if ((index % warp_size) == 0) {
-					buffer[warp_id] = partial;
-				}
-				n_sums = (n_sums << log_warp_size) + (n_sums % warp_size);
-			} else return;
-		}
-	result = buffer[0];
-	return;
-}*/
+        els = (V << log_warp_size) + (V % warp_size);
+
+        while (els > 1) {
+            //if (id > els)
+            //    return;
+            partial = buffer[id];
+
+            for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+                partial += __shfl_down_sync(0xffffffff, partial, offset);
+            }
+
+            if (id % (warp_size) == 0)
+                buffer[id >> log_warp_size] = partial;
+        
+            els = (els << log_warp_size) + (els % warp_size);
+        }
+        result = buffer[0];
+    }
+}
+
 //////////////////////////////
 //////////////////////////////
 
@@ -207,11 +225,10 @@ void PersonalizedPageRank::alloc() {
 
     // Allocate any GPU data here;
     // TODO!
-    int size = sizeof(float) * E;
 
-    cudaMalloc(&x_gpu, size);
-    cudaMalloc(&y_gpu, size);
-    cudaMalloc(&val_gpu, size);
+    cudaMalloc(&x_gpu, sizeof(int)*E);
+    cudaMalloc(&y_gpu, sizeof(int)*V);
+    cudaMalloc(&val_gpu, sizeof(float)*E);
     cudaMalloc(&dangling_gpu, sizeof(int)*dangling.size());
     cudaMalloc(&V_gpu, sizeof(int));
     cudaMalloc(&E_gpu, sizeof(int));
@@ -283,17 +300,16 @@ void PersonalizedPageRank::reset() {
 
      int size = sizeof(float) * E;
 
-    float *val_float = (float *) malloc(sizeof(float)*E);
-    std::transform(val.begin(), val.end(), val_float, [](double d) -> float {return float(d);});
+    float *val_float = val_csr;
 
     float *pr_float = (float *) malloc(sizeof(float)*V);
     std::transform(pr.begin(), pr.end(), pr_float, [](double d) -> float {return float(d);});
 
    // Do any GPU reset here, and also transfer data to the GPU;
    // TODO!
-    cudaMemcpy(x_gpu, x.data(), size, cudaMemcpyHostToDevice);
-    cudaMemcpy(y_gpu, y.data(), size, cudaMemcpyHostToDevice);
-    cudaMemcpy(val_gpu, val_float, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(x_gpu, x_csr, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(y_gpu, y_ptr, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(val_gpu, val_csr, size, cudaMemcpyHostToDevice);
     cudaMemcpy(dangling_gpu, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(V_gpu, &V, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(E_gpu, &E, sizeof(int), cudaMemcpyHostToDevice);
@@ -310,7 +326,7 @@ void PersonalizedPageRank::execute(int iter) {
     // Do the GPU computation here, and also transfer results to the CPU;
     //TODO! (and save the GPU PPR values into the "pr" array)
     int block_size = 128;
-    int n_blocks = max(1, E / block_size);
+    int n_blocks = max(1, V / block_size);
     
     float alpha_f = (float) alpha;
     float* pr_tmp_cpu;
@@ -322,8 +338,15 @@ void PersonalizedPageRank::execute(int iter) {
         cudaMemset(pr_tmp, 0, sizeof(float) * V);
         memset(pr_tmp_cpu2, 0, sizeof(double) * V);
         if (debug) std::cout << "launching gpu kernel" << std::endl;
+
+        float dangling_factor = dot_product_cpu_float(dangling.data(), pr_tmp_cpu, V);
+        std::cout << "dang_cpu: "<< dangling_factor << std::endl;
+        float dang_gpu = 0;
+        dangle_factor<<<n_blocks, block_size>>>(x_gpu, y_gpu, pr_gpu, V, dang_gpu);
+        std::cout << "dang_gpu: "<< dang_gpu << std::endl;
+
         
-        //spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, E);
+        spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, V, dang_gpu, personalization_vertex);
         
         spmv_coo_cpu(x.data(), y.data(), val.data(), pr.data(), pr_tmp_cpu2, E);
         if (debug) std::cout << "exiting gpu kernel" << std::endl;
@@ -334,13 +357,14 @@ void PersonalizedPageRank::execute(int iter) {
         float maxErr = 0;
         for (int i = 0; i < V; i++) {
             float err = abs(pr_tmp_cpu[i] - (float) pr_tmp_cpu2[i]);
+
             if (err > maxErr)
                 maxErr = err;
         }
         
         std::cout << "maxErr: "<< maxErr << std::endl;
         
-        //float dangling_factor = dot_product_cpu_float(dangling.data(), pr_tmp_cpu, V); 
+        
         //axpb_personalized_cpu_float(alpha_f, pr_tmp_cpu, alpha_f * dangling_factor / V, personalization_vertex, pr_tmp_cpu, V);
         
         // Check convergence;
