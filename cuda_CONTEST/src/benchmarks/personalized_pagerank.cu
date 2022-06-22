@@ -46,40 +46,39 @@ float *pr_gpu;
 float *pr_tmp;
 int *dangling_gpu;
 
+int *x_csr;
+int *y_ptr;
+float *val_csr;
+
 #define log_warp_size 5;
 #define warp_size 32;
 
-__global__ void spmv(const int *x, const int *y, const float *val, const float *vec, float *result, int N) {
+__global__ void spmv(
+                    const int *x, 
+                    const int *y, //y_ptr
+                    const float *val, 
+                    const float *vec, 
+                    float *result, 
+                    int E, 
+                    int V,
+                    float dang,
+                    int pers) {
 	int id = threadIdx.x+blockIdx.x*blockDim.x;
-	
-    float part = val[id] * vec[y[id]];
-	int warp = threadIdx.x >> log_warp_size;
-    
-    atomicAdd(&result[x[id]], part);
-    //assert(x[index] >= x[index+1]);
-    /*bool first = id == 0 ? true : x[id] != x[id-1];
-    
-	if(id < N && (first || threadIdx.x % warp == 0)) {
-        //sum over warp
-        int leader = x[id];
-        unsigned mask = __ballot_sync(0xffffffff, x[id] == leader);
-        int offset = 1;
-        int limit = (warp+1) << log_warp_size;
-		while (id + offset < limit) {
-            if (x[id] != x[id + offset])
-                break;
-            part += __shfl_down_sync(mask, part, offset);
-            offset++;
+	int res = 0;
+    if (id < E - 1) {
+        int els = y[id] - (id == 0 ? 0 : y[id-1]);
+        if (els = 0) {
+            res = dang;
         }
-		//check off by 1
-        int first = warp << log_warp_size;
-        int last = (warp + 1) << log_warp_size;
-        if (last >= N)
-            last = N-1;
-		if ((x[id] == x[first]) || (x[id] == x[last])) 
-			atomicAdd(&result[x[id]], part);
-		else result[x[id]] = part;
-	}*/
+        else {
+            for(int i = 0; i < els; i++) {
+                res += val[y[id] + i] * vec[x[y[id]+i]];
+                //check personalization vector
+            }
+        }
+        //syncthreads before write?
+        result[id] = res;
+    }
 }
 /*
 __global__ void dangle_factor(const int *dangle, const int *pr, int V, float *buffer, float result) {
@@ -143,6 +142,15 @@ inline float euclidean_distance_cpu_float(const float *x, const float *y, const 
         result += tmp * tmp;
     }
     return std::sqrt(result);
+}
+
+bool sort_csr(const std::tuple<int, int, float>& a, 
+              const std::tuple<int, int, float>& b)
+{
+    if (std::get<1>(a) != std::get<1>(b))
+        return (std::get<1>(a) < std::get<1>(b));
+    else
+        return std::get<0>(a) < std::get<0>(b);
 }
 
 // Read the input graph and initialize it;
@@ -215,12 +223,52 @@ void PersonalizedPageRank::alloc() {
 void PersonalizedPageRank::init() {
     // Do any additional CPU or GPU setup here;
     // TODO!
+    
+    //convert to CSR
+    x_csr = (int *) malloc(sizeof(int)*E);
+    y_ptr = (int *) malloc(sizeof(int)*V);
+    val_csr = (float *) malloc(sizeof(float)*E);
+    memset(x_csr, 0, sizeof(int) * E);
+    memset(y_ptr, 0, sizeof(int) * V);
+
+    for(int i = 0; i < E; i++) {
+        y_ptr[y[i]]++;
+    }
+
+    for(int i = 0; i < V-1; i++) {
+        y_ptr[i+1] += y_ptr[i];
+    }
+
+    memcpy(x_csr, x.data(), sizeof(int) * E);
+    memcpy(val_csr, val.data(), sizeof(float) * E);
+
+    std::vector<std::tuple<int, int, float>> v;
+    for(int i = 0; i < E; i++) {       
+        v.push_back(std::make_tuple(x[i], y[i], val[i]));
+    }
+    
+    sort(v.begin(), v.end(), sort_csr);
+
+    for(int i = 0; i < E; i++) {
+        x_csr[i] = std::get<0>(v[i]);
+        val_csr[i] = std::get<2>(v[i]);
+    }
     /*
-    for (int i = 0; i < V; i++) {
-        pr_float[i] = 1.0 / V;
-    }*/
-
-
+    int els = 41;
+    std::cout << "x_csr: ";
+    for(int i = 0; i < els; i++) {
+        std::cout << x_csr[i] << ", ";
+    }
+    std::cout << std::endl << "y_ptr: ";
+    for(int i = 0; i < els; i++) {
+        if (i < V)
+            std::cout << y_ptr[i] << ", ";
+    }
+    std::cout << std::endl << "val: ";
+    for(int i = 0; i < els; i++) {
+        std::cout << val_csr[i] << ", ";
+    }
+    */
 }
 
 
@@ -275,7 +323,7 @@ void PersonalizedPageRank::execute(int iter) {
         memset(pr_tmp_cpu2, 0, sizeof(double) * V);
         if (debug) std::cout << "launching gpu kernel" << std::endl;
         
-        spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, E);
+        //spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, E);
         
         spmv_coo_cpu(x.data(), y.data(), val.data(), pr.data(), pr_tmp_cpu2, E);
         if (debug) std::cout << "exiting gpu kernel" << std::endl;
@@ -292,8 +340,8 @@ void PersonalizedPageRank::execute(int iter) {
         
         std::cout << "maxErr: "<< maxErr << std::endl;
         
-        float dangling_factor = dot_product_cpu_float(dangling.data(), pr_tmp_cpu, V); 
-        axpb_personalized_cpu_float(alpha_f, pr_tmp_cpu, alpha_f * dangling_factor / V, personalization_vertex, pr_tmp_cpu, V);
+        //float dangling_factor = dot_product_cpu_float(dangling.data(), pr_tmp_cpu, V); 
+        //axpb_personalized_cpu_float(alpha_f, pr_tmp_cpu, alpha_f * dangling_factor / V, personalization_vertex, pr_tmp_cpu, V);
         
         // Check convergence;
         //float err = euclidean_distance_cpu_float(pr_gpu, pr_tmp, V);
