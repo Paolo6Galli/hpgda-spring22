@@ -50,34 +50,36 @@ float *pr_gpu;
 float *pr_tmp;
 int *dangling_gpu;
 
-int *x_csr;
-int *y_ptr;
+int *y_csr;
+int *x_ptr;
 float *val_csr;
 
 //#define log_warp_size 5;
 //#define warp_size 32;
 
 __global__ void spmv(
-                    const int *x, 
-                    const int *y, //y_ptr
+                    const int *x, //x_ptr
+                    const int *y, 
                     const float *val, 
                     const float *vec, 
                     float *result,
                     int V,
-                    float dang,
-                    int pers) {
+                    int pers,
+                    float alpha,
+                    float beta) {
 	int id = threadIdx.x+blockIdx.x*blockDim.x;
 	int res = 0;
     if (id < V - 1) {
-        int els = y[id] - (id == 0 ? 0 : y[id-1]);
-        if (els == 0) {
-            res = dang;
-        }
-        else {
-            for(int i = 0; i < els; i++) {
-                res += val[y[id] + i] * vec[x[y[id]+i]];
-                //check personalization vector
-            }
+        int els = x[id] - (id == 0 ? 0 : x[id-1]);
+
+        for(int i = 0; i < els; i++) {
+            res += val[x[id] + i] * vec[y[x[id]+i]];
+
+            if (x[i] != x[i + 1])
+                res = (res * alpha) + beta;
+            //check personalization vector
+            if (x[id] == pers)
+                res += 1 - alpha;
         }
         //syncthreads before write?
         result[id] = res;
@@ -85,8 +87,8 @@ __global__ void spmv(
 }
 
 __global__ void dangle_factor(
-                            const int *x,
-                            const int *y, //y_ptr
+                            const int *x, //x_ptr
+                            const int *y, 
                             const float *pr,
                             int V,
                             float result) {
@@ -99,9 +101,9 @@ __global__ void dangle_factor(
     int log_warp_size = 5;
 
     if (id < V - 1) {
-        int els = y[id] - (id == 0 ? 0 : y[id-1]);
+        int els = x[id] - (id == 0 ? 0 : x[id-1]);
         if (els == 0) {
-            partial = pr[x[y[id]]];
+            partial = pr[y[x[id]]];
         }
         for (int offset = warp_size / 2; offset > 0; offset /= 2) {
             partial += __shfl_down_sync(0xffffffff, partial, offset);
@@ -140,6 +142,8 @@ inline float dot_product_cpu_float(const int *a, const float *b, const int N) {
     float result = 0;
     for (int i = 0; i < N; i++) {
         result += a[i] * b[i];
+        if (a[i] == 1 && b[i] != 0)
+            std::cout << "----------------- result = old + " << a[i] << " * " << b[i] << std::endl;
     }
     return result;
 }
@@ -226,12 +230,10 @@ void PersonalizedPageRank::alloc() {
     // Allocate any GPU data here;
     // TODO!
 
-    cudaMalloc(&x_gpu, sizeof(int)*E);
-    cudaMalloc(&y_gpu, sizeof(int)*V);
+    cudaMalloc(&x_gpu, sizeof(int)*V);
+    cudaMalloc(&y_gpu, sizeof(int)*E);
     cudaMalloc(&val_gpu, sizeof(float)*E);
     cudaMalloc(&dangling_gpu, sizeof(int)*dangling.size());
-    cudaMalloc(&V_gpu, sizeof(int));
-    cudaMalloc(&E_gpu, sizeof(int));
     cudaMalloc(&pr_gpu, sizeof(float) * V);
     cudaMalloc(&pr_tmp, sizeof(float) * V);
 }
@@ -242,34 +244,17 @@ void PersonalizedPageRank::init() {
     // TODO!
     
     //convert to CSR
-    x_csr = (int *) malloc(sizeof(int)*E);
-    y_ptr = (int *) malloc(sizeof(int)*V);
-    val_csr = (float *) malloc(sizeof(float)*E);
-    memset(x_csr, 0, sizeof(int) * E);
-    memset(y_ptr, 0, sizeof(int) * V);
+    x_ptr = (int *) malloc(sizeof(int)*V);
+    memset(x_ptr, 0, sizeof(int) * V);
 
     for(int i = 0; i < E; i++) {
-        y_ptr[y[i]]++;
+        x_ptr[x[i]]++;
     }
 
     for(int i = 0; i < V-1; i++) {
-        y_ptr[i+1] += y_ptr[i];
+        x_ptr[i+1] += x_ptr[i];
     }
 
-    memcpy(x_csr, x.data(), sizeof(int) * E);
-    memcpy(val_csr, val.data(), sizeof(float) * E);
-
-    std::vector<std::tuple<int, int, float>> v;
-    for(int i = 0; i < E; i++) {       
-        v.push_back(std::make_tuple(x[i], y[i], val[i]));
-    }
-    
-    sort(v.begin(), v.end(), sort_csr);
-
-    for(int i = 0; i < E; i++) {
-        x_csr[i] = std::get<0>(v[i]);
-        val_csr[i] = std::get<2>(v[i]);
-    }
     /*
     int els = 41;
     std::cout << "x_csr: ";
@@ -292,28 +277,31 @@ void PersonalizedPageRank::init() {
 // Reset the state of the computation after every iteration.
 // Reset the result, and transfer data to the GPU if necessary;
 void PersonalizedPageRank::reset() {
-   // Reset the PageRank vector (uniform initialization, 1 / V for each vertex);
-   std::fill(pr.begin(), pr.end(), 1.0 / V); 
-   // Generate a new personalization vertex for this iteration;
-   personalization_vertex = rand() % V; 
-   if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
+    // Reset the PageRank vector (uniform initialization, 1 / V for each vertex);
+    std::fill(pr.begin(), pr.end(), 1.0 / V); 
+    // Generate a new personalization vertex for this iteration;
+    personalization_vertex = rand() % V; 
+    if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
 
-     int size = sizeof(float) * E;
-
-    float *val_float = val_csr;
+    float *val_float = (float *) malloc(sizeof(float)*E);
+    std::transform(val.begin(), val.end(), val_float, [](double d) -> float {return float(d);});
 
     float *pr_float = (float *) malloc(sizeof(float)*V);
-    std::transform(pr.begin(), pr.end(), pr_float, [](double d) -> float {return float(d);});
 
-   // Do any GPU reset here, and also transfer data to the GPU;
-   // TODO!
-    cudaMemcpy(x_gpu, x_csr, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(y_gpu, y_ptr, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(val_gpu, val_csr, size, cudaMemcpyHostToDevice);
+    float smallest = std::max(float(1.0/V) , float(1.0e-30));
+    if (debug)
+        std::cout << "initializing pr to: " << smallest << std::endl;
+    for (int i = 0; i < V; i++) {
+        pr_float[i] = smallest;
+    }
+    // Do any GPU reset here, and also transfer data to the GPU;
+    // TODO!
+    cudaMemcpy(x_gpu, x_ptr, sizeof(float) * V, cudaMemcpyHostToDevice);
+    cudaMemcpy(y_gpu, y.data(), sizeof(float) * E, cudaMemcpyHostToDevice);
+    cudaMemcpy(val_gpu, val_csr, sizeof(float) * E, cudaMemcpyHostToDevice);
     cudaMemcpy(dangling_gpu, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(V_gpu, &V, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(E_gpu, &E, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(pr_gpu, pr_float, sizeof(float) * V, cudaMemcpyHostToDevice);
+
 
     // Print out the vector
     std::cout << "E = " << E << " V = " << V << std::endl;
@@ -329,7 +317,12 @@ void PersonalizedPageRank::execute(int iter) {
     int n_blocks = max(1, V / block_size);
     
     float alpha_f = (float) alpha;
-    float* pr_tmp_cpu;
+    float* pr_tmp_cpu = (float*) malloc(sizeof(float)*V);
+    float smallest = std::max(float(1.0/V) , float(1.0e-30));
+    for (int i = 0; i < V; i++) {
+        pr_tmp_cpu[i] = smallest;
+    }
+
     double* pr_tmp_cpu2 = (double*) malloc(sizeof(double)*V);
 
     bool converged = false;
@@ -338,17 +331,21 @@ void PersonalizedPageRank::execute(int iter) {
         cudaMemset(pr_tmp, 0, sizeof(float) * V);
         memset(pr_tmp_cpu2, 0, sizeof(double) * V);
         if (debug) std::cout << "launching gpu kernel" << std::endl;
-
+        
         float dangling_factor = dot_product_cpu_float(dangling.data(), pr_tmp_cpu, V);
         std::cout << "dang_cpu: "<< dangling_factor << std::endl;
         float dang_gpu = 0;
+        
         dangle_factor<<<n_blocks, block_size>>>(x_gpu, y_gpu, pr_gpu, V, dang_gpu);
         std::cout << "dang_gpu: "<< dang_gpu << std::endl;
+        
 
         
-        spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, V, dang_gpu, personalization_vertex);
+        spmv<<<n_blocks, block_size>>>(x_gpu, y_gpu, val_gpu, pr_gpu, pr_tmp, V, personalization_vertex,
+                                    (float) alpha, (float) alpha * dang_gpu / V);
         
         spmv_coo_cpu(x.data(), y.data(), val.data(), pr.data(), pr_tmp_cpu2, E);
+        axpb_personalized_cpu(alpha, pr_tmp_cpu2, alpha * dangling_factor / V, personalization_vertex, pr_tmp_cpu2, V);
         if (debug) std::cout << "exiting gpu kernel" << std::endl;
         
         pr_tmp_cpu = (float *) malloc(sizeof(float)*V);
