@@ -3,3 +3,6 @@ data_struct_CONTEST/data/*.dfs
 data_struct_CONTEST/bin/*
 data_struct_CONTEST/eval_graphs*
 data_struct_CONTEST/myresults_*
+cuda_CONTEST/.vscode/settings.json
+cuda_CONTEST/.vscode/c_cpp_properties.json
+cuda_CONTEST/.vscode/tasks.json
