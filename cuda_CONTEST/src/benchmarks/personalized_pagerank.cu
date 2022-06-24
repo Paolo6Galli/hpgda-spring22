@@ -72,20 +72,15 @@ void spmv_sim(
         int els = x[id+1] - x[id];
         for(int i = 0; i < els; i++) {
             res += val[x[id] + i] * vec[y[x[id] + i]];
-            //if (vec[y[x[id] - els +i]] != 0)
-                //std::cout << "vec[y[x[id] - els +i]] = "<< vec[y[x[id] - els +i]] << std::endl;
-            if (i == els -1){
-                res = (res * alpha) + beta;
-                //check personalization vector
-                if (id == pers) {
-                    res = res + (1 - alpha);
-                }
-            }
         }
         //syncthreads before write?
-        
-        result[id] = res;
 
+        res = (res * alpha) + beta;
+        //check personalization vector
+        if (id == pers) {
+            res = res + (1 - alpha);
+        }
+        result[id] = res;
     }
 }
 
@@ -375,7 +370,7 @@ void PersonalizedPageRank::execute(int iter) {
         double dangling_factor = dot_product_cpu(dangling.data(), pr_cpu, V);
         //std::cout << "dang_cpu: "<< dangling_factor << std::endl;
         axpb_personalized_cpu(alpha, pr_tmp_cpu, alpha * dangling_factor / V, personalization_vertex, pr_tmp_cpu, V);
-        
+        //std::cout << "beta_cpu = " << (float) alpha * dangling_factor / V << std::endl;
         memcpy(pr_cpu, pr_tmp_cpu, sizeof(double) * V);
         
         //if (debug) std::cout << "launching gpu kernel" << std::endl;
@@ -409,15 +404,16 @@ void PersonalizedPageRank::execute(int iter) {
                                     (float) alpha, (float) alpha * dang_gpu / V, i);
         }       
         memcpy(pr_sim, pr_tmp_sim, sizeof(float) * V);
-/*
+        /*
         for (int i = 0; i < 20; i++) {
-            if (iter < 2) {
+            if (iter < 3) {
             std::cout << "expected = " << pr_tmp_cpu[i] << std::endl;
             std::cout << "found    = " << pr_tmp_sim[i] << std::endl;
             }
-        }*/
+        }
+        */
         
-
+        //std::cout << "beta_sim = " << (float) alpha * dang_gpu / V << std::endl;
         cudaMemcpy(pr_gpu, pr_tmp, sizeof(float) * V, cudaMemcpyDeviceToDevice);
         
         iter++;
@@ -425,12 +421,17 @@ void PersonalizedPageRank::execute(int iter) {
     }
 
     std::copy(pr_sim, pr_sim + V, pr.data());
+    /*
     std::sort(pr_sim, pr_sim + V, std::greater<float>());
+
+    std::sort(pr_cpu, pr_cpu + V, std::greater<float>());
     for(int i = 0; i < V; i++) {
-        if (i < 20)
-            std::cout << "pr of v_" << i << " = " << pr_sim[i] << std::endl;
+        if (i < 20) {
+            std::cout << "sim res" << i << " = " << pr_sim[i];
+            std::cout << "cpu res" << i << " = " << pr_cpu[i] << std::endl;
+        }
     }      
-    
+    */
     
     //cudaMemcpy(pr.data(), pr_gpu, sizeof(float) * V, cudaMemcpyDeviceToHost);
     free(pr_cpu);
